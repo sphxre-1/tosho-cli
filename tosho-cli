@@ -1,0 +1,1393 @@
+#!/usr/bin/env bash
+#
+# tosho-cli 3.8 — AniList/AniMap season-safe AnimeTosho matching + TorBox playback
+#
+# Usage:
+#   tosho-cli "One Piece"
+#   tosho-cli -s "One Piece"
+#   tosho-cli --sync "Frieren"
+#
+# Config:
+#   ~/.config/tosho-cli/config
+#   TORBOX_KEY=...
+#
+# Optional config overrides:
+#   ANILIST_API_URL="https://graphql.anilist.co"
+#   ANIMETOSHO_URL="https://feed.animetosho.xyz"
+#   ANIMETOSHO_JSON_PATH="/json"
+#   TORBOX_API_BASE="https://api.torbox.app"
+#   TORBOX_API_VERSION="v1"
+#   SYNCPLAY_SERVER="syncplay.pl:8999"
+#   SYNCPLAY_ROOM="anime-lounge"
+#
+
+set -o pipefail
+
+# Resolve the absolute path to this script for exec-based episode chaining.
+SELF="$(readlink -f "$0" 2>/dev/null || realpath "$0" 2>/dev/null || echo "$0")"
+
+# === CONFIGURATION & DEFAULTS ==============================================
+CONFIG_ROOT="${XDG_CONFIG_HOME:-$HOME/.config}"
+CONFIG_FILE="$CONFIG_ROOT/tosho-cli/config"
+
+# Safe config parser: only accepts KEY=VALUE lines with whitelisted keys.
+if [ -f "$CONFIG_FILE" ]; then
+	while IFS='=' read -r _cfg_key _cfg_value; do
+		# Strip leading/trailing whitespace and optional quotes from value.
+		_cfg_key=$(printf '%s' "$_cfg_key" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+		_cfg_value=$(printf '%s' "$_cfg_value" | sed "s/^[[:space:]]*//;s/[[:space:]]*$//;s/^[\"']//;s/[\"']$//")
+		case "$_cfg_key" in
+		TORBOX_KEY) TORBOX_KEY="$_cfg_value" ;;
+		ANILIST_API_URL) ANILIST_API_URL="$_cfg_value" ;;
+		ANIMETOSHO_URL) ANIMETOSHO_URL="$_cfg_value" ;;
+		ANIMETOSHO_JSON_PATH) ANIMETOSHO_JSON_PATH="$_cfg_value" ;;
+		ANIMAP_API_BASE) ANIMAP_API_BASE="$_cfg_value" ;;
+		TORBOX_API_BASE) TORBOX_API_BASE="$_cfg_value" ;;
+		TORBOX_API_VERSION) TORBOX_API_VERSION="$_cfg_value" ;;
+		SYNCPLAY_SERVER) SYNCPLAY_SERVER="$_cfg_value" ;;
+		SYNCPLAY_ROOM) SYNCPLAY_ROOM="$_cfg_value" ;;
+		SYNCPLAY_USER) SYNCPLAY_USER="$_cfg_value" ;;
+		TORBOX_MAX_WAIT) TORBOX_MAX_WAIT="$_cfg_value" ;;
+		TORBOX_POLL_INTERVAL) TORBOX_POLL_INTERVAL="$_cfg_value" ;;
+		MPV_AUDIO_LANGS) MPV_AUDIO_LANGS="$_cfg_value" ;;
+		MPV_SUB_LANGS) MPV_SUB_LANGS="$_cfg_value" ;;
+		esac
+	done < <(grep -E '^[[:space:]]*[A-Za-z_][A-Za-z_0-9]*=' "$CONFIG_FILE")
+fi
+
+TORBOX_KEY="${TORBOX_KEY:-}"
+ANILIST_API_URL="${ANILIST_API_URL:-https://graphql.anilist.co}"
+ANIMETOSHO_URL="${ANIMETOSHO_URL:-https://feed.animetosho.xyz}"
+ANIMETOSHO_JSON_PATH="${ANIMETOSHO_JSON_PATH:-/json}"
+ANIMAP_API_BASE="${ANIMAP_API_BASE:-https://animap.id}"
+TORBOX_API_BASE="${TORBOX_API_BASE:-https://api.torbox.app}"
+TORBOX_API_VERSION="${TORBOX_API_VERSION:-v1}"
+
+SYNCPLAY_SERVER="${SYNCPLAY_SERVER:-syncplay.pl:8999}"
+SYNCPLAY_ROOM="${SYNCPLAY_ROOM:-}"
+SYNCPLAY_USER="${SYNCPLAY_USER:-${USER:-$LOGNAME}}"
+
+TORBOX_MAX_WAIT="${TORBOX_MAX_WAIT:-180}"
+TORBOX_POLL_INTERVAL="${TORBOX_POLL_INTERVAL:-2}"
+
+# Playback language preferences.
+MPV_AUDIO_LANGS="${MPV_AUDIO_LANGS:-jpn,ja,eng,en}"
+MPV_SUB_LANGS="${MPV_SUB_LANGS:-eng,en}"
+
+# === HELPERS ================================================================
+error() {
+	printf 'Error: %s\n' "$*" >&2
+	exit 1
+}
+
+require_cmd() {
+	command -v "$1" >/dev/null 2>&1 || error "Required dependency '$1' is not installed."
+}
+
+# Interactive first-run setup wizard.
+run_setup_wizard() {
+	printf '\n'
+	printf '  ╔══════════════════════════════════════════╗\n'
+	printf '  ║       tosho-cli — First-Time Setup       ║\n'
+	printf '  ╚══════════════════════════════════════════╝\n'
+	printf '\n'
+
+	local _wiz_key="" _wiz_host="" _wiz_port="" _wiz_room=""
+
+	# TorBox API key (required).
+	while [ -z "$_wiz_key" ]; do
+		read -r -s -p "  Enter your TorBox API key (input is hidden): " _wiz_key
+		printf '\n'
+		if [ -z "$_wiz_key" ]; then
+			printf '  A TorBox API key is required to use tosho-cli.\n'
+		fi
+	done
+
+	# Write config file.
+	mkdir -p "$(dirname "$CONFIG_FILE")"
+	cat >"$CONFIG_FILE" <<WIZCONF
+TORBOX_KEY=$_wiz_key
+
+# --- Syncplay Configuration ---
+# To use the --sync flag, you MUST uncomment and set a unique room name below.
+# SYNCPLAY_SERVER=syncplay.pl:8999
+# SYNCPLAY_ROOM=my-unique-room-name
+# SYNCPLAY_USER=$USER
+WIZCONF
+	chmod 600 "$CONFIG_FILE" 2>/dev/null || true
+
+	# Apply to current session so the script can continue without restarting.
+	TORBOX_KEY="$_wiz_key"
+
+	printf '\n  Config saved to %s\n' "$CONFIG_FILE"
+	printf '  If you made a mistake, you can edit this file to fix your API key.\n\n'
+}
+
+for cmd in curl jq fzf mpv socat syncplay; do
+	require_cmd "$cmd"
+done
+
+if [ -z "$TORBOX_KEY" ] || [ "$TORBOX_KEY" = "YOUR_TORBOX_API_KEY_HERE" ]; then
+	if [ -t 0 ] && [ -t 1 ]; then
+		run_setup_wizard
+	else
+		error "TORBOX_KEY is missing. Run tosho-cli interactively to set up, or add it to $CONFIG_FILE."
+	fi
+fi
+
+USE_SYNCPLAY=false
+RESUME_MODE=false
+RESUME_ANILIST_ID=""
+RESUME_AID=""
+RESUME_MAL_ID=""
+RESUME_TITLE=""
+RESUME_EPISODE=""
+RESUME_FORMAT="TV"
+RESUME_TOTAL_EPS=""
+RESUME_MAX_EPISODE=""
+RESUME_ABSOLUTE_OFFSET=""
+ARGS=()
+for arg in "$@"; do
+	case "$arg" in
+	-s | --sync)
+		USE_SYNCPLAY=true
+		;;
+	--internal-resume)
+		RESUME_MODE=true
+		;;
+	--internal-anilist-id=*)
+		RESUME_ANILIST_ID="${arg#*=}"
+		;;
+	--internal-anidb-aid=*)
+		RESUME_AID="${arg#*=}"
+		;;
+	--internal-mal-id=*)
+		RESUME_MAL_ID="${arg#*=}"
+		;;
+	--internal-title=*)
+		RESUME_TITLE="${arg#*=}"
+		;;
+	--internal-episode=*)
+		RESUME_EPISODE="${arg#*=}"
+		;;
+	--internal-format=*)
+		RESUME_FORMAT="${arg#*=}"
+		;;
+	--internal-total-eps=*)
+		RESUME_TOTAL_EPS="${arg#*=}"
+		;;
+	--internal-max-episode=*)
+		RESUME_MAX_EPISODE="${arg#*=}"
+		;;
+	--internal-absolute-offset=*)
+		RESUME_ABSOLUTE_OFFSET="${arg#*=}"
+		;;
+	-h | --help)
+		cat <<'EOF'
+Usage:
+  tosho-cli "anime title"
+  tosho-cli --sync "anime title"
+
+Options:
+  -s, --sync    Launch the selected release through Syncplay.
+  -h, --help    Show this help.
+
+Config:
+  ~/.config/tosho-cli/config
+EOF
+		exit 0
+		;;
+	*)
+		ARGS+=("$arg")
+		;;
+	esac
+done
+
+# Fetch AnimeTosho JSON.
+anime_tosho_query() {
+	local -a data_args=("--data-urlencode" "qx=1")
+	local q_value=""
+	local aids_value=""
+	local page_value="1"
+
+	while [ "$#" -gt 0 ]; do
+		case "$1" in
+		q=*)
+			q_value="${1#q=}"
+			;;
+		aids=*)
+			aids_value="${1#aids=}"
+			;;
+		page=*)
+			page_value="${1#page=}"
+			;;
+		esac
+		shift
+	done
+
+	[ -n "$q_value" ] && data_args+=("--data-urlencode" "q=$q_value")
+	[ -n "$aids_value" ] && data_args+=("--data-urlencode" "aids=$aids_value")
+	data_args+=("--data-urlencode" "page=$page_value")
+
+	local endpoint="$ANIMETOSHO_URL$ANIMETOSHO_JSON_PATH"
+	local fallback_endpoint="$ANIMETOSHO_URL/api"
+
+	if curl -fsS \
+		--connect-timeout 10 \
+		--max-time 30 \
+		-G \
+		-H 'Accept: application/json' \
+		-H 'User-Agent: tosho-cli/3.8' \
+		"$endpoint" \
+		"${data_args[@]}"; then
+		return 0
+	fi
+
+	if [ "$endpoint" != "$fallback_endpoint" ]; then
+		curl -fsS \
+			--connect-timeout 10 \
+			--max-time 30 \
+			-G \
+			-H 'Accept: application/json' \
+			-H 'User-Agent: tosho-cli/3.8' \
+			"$fallback_endpoint" \
+			"${data_args[@]}"
+		return $?
+	fi
+
+	return 1
+}
+
+normalize_tosho_json() {
+	jq -c '
+      if type == "array" then .
+      elif (.data? | type) == "array" then .data
+      elif (.results? | type) == "array" then .results
+      elif (.items? | type) == "array" then .items
+      else []
+      end
+    '
+}
+
+# Extract AniDB ID from URL.
+extract_anidb_aid() {
+	sed -nE 's#.*anidb\.net/(anime/)?a?([0-9]+).*#\2#p' | head -n1
+}
+
+# Filter releases by AID+EID and validate batch ranges.
+
+filter_episode_releases() {
+	local json="$1"
+	local aid="$2"
+	local eid="$3"
+	local ep="$4"
+	local offset="$5"
+	[ -z "$offset" ] && offset=0
+	local abs_ep=$((ep + offset))
+
+	jq -c --arg aid "$aid" --arg eid "$eid" --argjson ep "$ep" --argjson abs_ep "$abs_ep" '
+      def title_of: (.title // .name // .release // "");
+      def title_matches_episode:
+        title_of as $t |
+        ($t | test("(^|[^0-9])((S[0-9]{1,2}[ ._-]*)?(E|EP(ISODE)?)[ ._-]*0*" + ($ep|tostring) + "(V[0-9]+)?([^0-9]|$)|0*" + ($ep|tostring) + "([^0-9]|$))"; "i"))
+        or ($abs_ep > 0 and ($t | test("(^|[^0-9])((S[0-9]{1,2}[ ._-]*)?(E|EP(ISODE)?)[ ._-]*0*" + ($abs_ep|tostring) + "(V[0-9]+)?([^0-9]|$)|0*" + ($abs_ep|tostring) + "([^0-9]|$))"; "i")));
+      def batch_range_contains_episode:
+        title_of as $t |
+        # Explicit season+episode range, e.g. S01E01-S01E28.
+        "\\bS(?<s1>[0-9]{1,2})[ ._-]*(?:E|EP|EPISODE)[ ._-]*(?<e1>[0-9]{1,4})[[:space:]]*[-~][[:space:]]*(?:S[0-9]{1,2}[ ._-]*)?(?:E|EP|EPISODE)[ ._-]*(?<e2>[0-9]{1,4})\\b" as $sre |
+        # Plain episode range, e.g. 01-28 or 01 ~ 28.
+        "(?:^|[^0-9])(?<e1>[0-9]{1,3})[[:space:]]*[-~][[:space:]]*(?<e2>[0-9]{1,3})(?:[^0-9]|$)" as $bre |
+        if ($t | test($sre; "i")) then
+          ($t | capture($sre; "i")) as $m
+          | (($m.e1|tonumber) <= $ep and $ep <= ($m.e2|tonumber))
+        elif ($t | test($bre)) then
+          ($t | capture($bre)) as $m
+          | (($m.e1|tonumber) <= $ep and $ep <= ($m.e2|tonumber))
+        else false end;
+
+      ($eid | split(" ") | map(select(. != ""))) as $eid_array |
+
+      [ .[]
+        | select((((.anidb_aid // .anidbAid // 0) | tostring) == $aid))
+        | select((.magnet_uri // .magnet // .magnetUri // "") != "")
+        | select(
+            (((.anidb_eid // .anidbEid // 0) | tostring) as $teid | ($eid_array | length > 0 and ($eid_array | index($teid) != null)))
+            or batch_range_contains_episode
+            or title_matches_episode
+          )
+      ]
+    ' <<<"$json"
+}
+
+# Discover canonical AnimeTosho EID.
+discover_tosho_eid() {
+	local json="$1"
+	local ep="$2"
+	local offset="$3"
+	[ -z "$offset" ] && offset=0
+	local abs_ep=$((ep + offset))
+
+	jq -r --argjson ep "$ep" --argjson abs_ep "$abs_ep" '
+      [ .[]
+        | select((.anidb_eid // .anidbEid // 0) != 0)
+        | (.title // .name // "") as $title
+        | select(
+            ($title | test("(^|[^0-9])((S[0-9]{1,2}[ ._-]*)?(E|EP(ISODE)?)[ ._-]*0*" + ($ep|tostring) + "(V[0-9]+)?([^0-9]|$)|0*" + ($ep|tostring) + "([^0-9]|$))"; "i"))
+            or ($abs_ep > 0 and ($title | test("(^|[^0-9])((S[0-9]{1,2}[ ._-]*)?(E|EP(ISODE)?)[ ._-]*0*" + ($abs_ep|tostring) + "(V[0-9]+)?([^0-9]|$)|0*" + ($abs_ep|tostring) + "([^0-9]|$))"; "i")))
+          )
+        | select(($title | test("\\b(batch|complete|collection|season[[:space:]_-]*[0-9]+|cour[[:space:]_-]*[0-9]+|BD[ -]?box)\\b|[0-9]{1,3}[[:space:]]*[-~][[:space:]]*[0-9]{1,3}"; "i")) | not)
+        | ((.anidb_eid // .anidbEid) | tostring)
+      ]
+      | unique
+      | join(" ")
+    ' <<<"$json"
+}
+
+# Build display rows for fzf.
+build_release_lines() {
+	local json="$1"
+
+	jq -r '
+      def title_of: (.title // .name // .release // "Unknown") | gsub("[\\r\\n]"; " ");
+      def magnet_of: (.magnet_uri // .magnet // .magnetUri // "");
+      def size_of: ((.total_size // .size // 0) | tonumber? // 0);
+      def seed_of: ((.seeders // .seeds // .seed_count // 0) | tonumber? // 0);
+      def peer_of: ((.leechers // .peers // 0) | tonumber? // 0);
+      def cache_rank: (if ._torbox_cached == true then 1 else 0 end);
+      def resolution_rank:
+        title_of as $t |
+        if ($t | test("\\b(2160p|4k)\\b"; "i")) then 4
+        elif ($t | test("\\b1080p\\b"; "i")) then 3
+        elif ($t | test("\\b720p\\b"; "i")) then 2
+        elif ($t | test("\\b(576p|480p|360p)\\b"; "i")) then 1
+        else 0 end;
+      def cache_label:
+        if ._torbox_cached == true then "*"
+        elif ._torbox_cached == false then "X"
+        else "?" end;
+
+      map(
+        .
+        | ._title = title_of
+        | ._magnet = magnet_of
+        | ._size = size_of
+        | ._seed = seed_of
+        | ._peer = peer_of
+        | ._rank = resolution_rank
+        | ._cache_rank = cache_rank
+        | ._cache_label = cache_label
+        | ._size_label = (
+            if ._size >= 1073741824 then ((._size / 1073741824 * 10 | floor) / 10 | tostring) + " GiB"
+            elif ._size >= 1048576 then ((._size / 1048576 * 10 | floor) / 10 | tostring) + " MiB"
+            elif ._size >= 1024 then ((._size / 1024 * 10 | floor) / 10 | tostring) + " KiB"
+            else (._size | tostring) + " B" end
+          )
+      )
+      | sort_by(-._cache_rank, -._rank, -._seed, -._size, ._title)
+      | .[]
+      | (if ._rank == 4 then "2160p/4K" elif ._rank == 3 then "1080p" elif ._rank == 2 then "720p" elif ._rank == 1 then "SD" else "?" end) as $res
+      | [
+          ._magnet,
+          ._cache_label + " " + $res + " [Seeds: " + (._seed|tostring) + "] " + ._title + " | " + ._size_label + " | Peers: " + (._peer|tostring)
+        ]
+      | @tsv
+    ' <<<"$json"
+}
+
+# Attach TorBox cache status.
+attach_torbox_cache_status() {
+	local json="$1"
+	local -a hashes=()
+	local hash
+	local cache_map='{}'
+	local i chunk cache_response cache_data cache_keys
+
+	while IFS= read -r hash; do
+		[ -n "$hash" ] && hashes+=("$hash")
+	done < <(jq -r '.[] | (.info_hash // .infoHash // "") | ascii_downcase | select(. != "")' <<<"$json" | awk 'NF && !seen[$0]++')
+
+	if [ "${#hashes[@]}" -eq 0 ]; then
+		jq -c 'map(._torbox_cached = null)' <<<"$json"
+		return 0
+	fi
+
+	for ((i = 0; i < ${#hashes[@]}; i += 100)); do
+		chunk="$(printf '%s\n' "${hashes[@]:i:100}" | paste -sd, -)"
+		cache_response=$(curl -fsS \
+			--connect-timeout 10 \
+			--max-time 20 \
+			-G \
+			-H "Authorization: Bearer $TORBOX_KEY" \
+			-H 'Accept: application/json' \
+			"$TORBOX_API_BASE/$TORBOX_API_VERSION/api/torrents/checkcached" \
+			--data-urlencode "hash=$chunk" \
+			--data-urlencode 'format=object' \
+			2>/dev/null || true)
+
+		if [ -z "$cache_response" ] || ! echo "$cache_response" | jq -e '.success == true' >/dev/null 2>&1; then
+			echo "Warning: TorBox cache lookup failed; using '?' for unknown cache status." >&2
+			jq -c 'map(._torbox_cached = null)' <<<"$json"
+			return 0
+		fi
+
+		cache_data=$(echo "$cache_response" | jq -c '.data // {}') || cache_data='{}'
+		cache_keys=$(jq -c '
+          if type == "object" then
+            reduce to_entries[] as $e ({}; .[($e.key | ascii_downcase)] = true)
+          elif type == "array" then
+            reduce .[] as $e ({};
+              if ($e | type) == "string" then .[($e | ascii_downcase)] = true
+              elif ($e.hash? // null) != null then .[($e.hash | ascii_downcase)] = true
+              else . end)
+          else {} end
+        ' <<<"$cache_data") || cache_keys='{}'
+		cache_map=$(jq -cn --argjson a "$cache_map" --argjson b "$cache_keys" '$a * $b')
+	done
+
+	jq -c --argjson cache "$cache_map" '
+      map(
+        ._hash = ((.info_hash // .infoHash // "") | ascii_downcase)
+        | ._torbox_cached = (
+            if ._hash == "" then null
+            elif ($cache[._hash]? == true) then true
+            else false
+            end
+          )
+      )
+    ' <<<"$json"
+}
+
+# Resolve AniList ID to AniDB AID via AniMap.
+extract_aid_from_v1_mapping() {
+	jq -r '
+        (.sources // [])[]?
+        | try (match("anidb\\.net/(?:anime/)?a?([0-9]+)"; "i").captures[0].string) catch empty
+    ' <<<"$1" 2>/dev/null | head -n1
+}
+
+extract_aid_from_legacy_mapping() {
+	jq -r '
+        if type == "array" then .[] else . end
+        | .anidb_id? // empty
+        | if type == "array" then .[] else . end
+    ' <<<"$1" 2>/dev/null | grep -E '^[0-9]+$' | head -n1
+}
+
+calculate_absolute_offset() {
+	local current_id="$1"
+	local total_offset=0
+	local depth=0
+
+	while [ -n "$current_id" ] && [ "$depth" -lt 10 ]; do
+		local json body
+		body=$(jq -n --argjson id "$current_id" '{query: "query($id:Int){Media(id:$id, type:ANIME){relations{edges{relationType node{id episodes type}}}} }", variables: {id: $id}}')
+
+		json=$(curl -fsS -X POST -H "Content-Type: application/json" -d "$body" "$ANILIST_API_URL" 2>/dev/null) || break
+
+		local prequel_json
+		prequel_json=$(jq -c '.data.Media.relations.edges[]? | select(.relationType == "PREQUEL" and .node.type == "ANIME") | .node' <<<"$json" | head -n 1)
+		[ -z "$prequel_json" ] && break
+
+		local p_id p_eps
+		p_id=$(jq -r '.id // empty' <<<"$prequel_json")
+		p_eps=$(jq -r '.episodes // empty' <<<"$prequel_json")
+		[ -z "$p_eps" ] && p_eps=0
+
+		if [ -n "$p_id" ]; then
+			total_offset=$((total_offset + p_eps))
+			current_id="$p_id"
+		else
+			break
+		fi
+		depth=$((depth + 1))
+	done
+
+	echo "$total_offset"
+}
+
+resolve_anidb_aid() {
+	local anilist_id="$1"
+	local mal_id="$2"
+	local mapping aid _animap_attempt
+
+	# Current AniMap API (with retry).
+	for _animap_attempt in 1 2; do
+		mapping=$(curl -fsS \
+			--connect-timeout 10 \
+			--max-time 15 \
+			-H 'Accept: application/json' \
+			-H 'User-Agent: tosho-cli/3.8' \
+			"$ANIMAP_API_BASE/api/v1/map/anilist/$anilist_id" 2>/dev/null || true)
+
+		aid=$(extract_aid_from_v1_mapping "$mapping")
+		if [ -n "$aid" ]; then
+			printf '%s\n' "$aid"
+			return 0
+		fi
+		[ "$_animap_attempt" -eq 1 ] && sleep 2
+	done
+
+	# Legacy AniMap API. Some installations/data snapshots still expose the
+	# old cross-ID arrays even when the v1 route is unavailable.
+	mapping=$(curl -fsS \
+		--connect-timeout 10 \
+		--max-time 15 \
+		-H 'Accept: application/json' \
+		-H 'User-Agent: tosho-cli/3.8' \
+		"$ANIMAP_API_BASE/api/map/anilist/$anilist_id" 2>/dev/null || true)
+
+	aid=$(extract_aid_from_legacy_mapping "$mapping")
+	if [ -n "$aid" ]; then
+		printf '%s\n' "$aid"
+		return 0
+	fi
+
+	# MAL can be another key into the same AniMap record.
+	if [[ "$mal_id" =~ ^[0-9]+$ ]]; then
+		mapping=$(curl -fsS \
+			--connect-timeout 10 \
+			--max-time 15 \
+			-H 'Accept: application/json' \
+			-H 'User-Agent: tosho-cli/3.8' \
+			"$ANIMAP_API_BASE/api/v1/map/mal/$mal_id" 2>/dev/null || true)
+
+		aid=$(extract_aid_from_v1_mapping "$mapping")
+		if [ -n "$aid" ]; then
+			printf '%s\n' "$aid"
+			return 0
+		fi
+
+		mapping=$(curl -fsS \
+			--connect-timeout 10 \
+			--max-time 15 \
+			-H 'Accept: application/json' \
+			-H 'User-Agent: tosho-cli/3.8' \
+			"$ANIMAP_API_BASE/api/map/$mal_id" 2>/dev/null || true)
+
+		aid=$(extract_aid_from_legacy_mapping "$mapping")
+		if [ -n "$aid" ]; then
+			printf '%s\n' "$aid"
+			return 0
+		fi
+	fi
+
+	return 1
+}
+
+# === 1. SEARCH QUERY ========================================================
+QUERY="${ARGS[*]}"
+if [ "$RESUME_MODE" = false ]; then
+	if [ -z "$QUERY" ]; then
+		read -r -p "Search Anime: " QUERY
+	fi
+	[ -z "$QUERY" ] && exit 0
+fi
+
+# === 2. SEARCH ANILIST ======================================================
+if [ "$RESUME_MODE" = true ]; then
+	ANILIST_ID="$RESUME_ANILIST_ID"
+	ANIDB_AID="$RESUME_AID"
+	MAL_ID="$RESUME_MAL_ID"
+	PREFERRED_TITLE="$RESUME_TITLE"
+	FORMAT="$RESUME_FORMAT"
+	TOTAL_EPS="$RESUME_TOTAL_EPS"
+	MAX_EPISODE="$RESUME_MAX_EPISODE"
+	ABSOLUTE_OFFSET="$RESUME_ABSOLUTE_OFFSET"
+	EP_CHOICE="$RESUME_EPISODE"
+	printf 'Continuing: %s (#%s) — Episode %s\n' "$PREFERRED_TITLE" "$ANILIST_ID" "$EP_CHOICE"
+	printf 'AniDB:    AID %s\n' "$ANIDB_AID"
+else
+	echo "Searching AniList..."
+
+	read -r -d '' ANILIST_QUERY <<'GRAPHQL' || true
+query SearchAnime($search: String!) {
+  Page(perPage: 20) {
+    media(search: $search, type: ANIME, sort: [SEARCH_MATCH, POPULARITY_DESC]) {
+      id
+      idMal
+      title {
+        romaji
+        english
+        native
+        userPreferred
+      }
+      format
+      status
+      startDate { year month day }
+      season
+      seasonYear
+      episodes
+      nextAiringEpisode { episode }
+      isAdult
+      synonyms
+      externalLinks {
+        url
+        site
+        siteId
+      }
+      relations {
+        edges {
+          relationType
+          node {
+            id
+            type
+            format
+          }
+        }
+      }
+    }
+  }
+}
+GRAPHQL
+
+	ANILIST_PAYLOAD=$(jq -cn \
+		--arg query "$ANILIST_QUERY" \
+		--arg search "$QUERY" \
+		'{query: $query, variables: {search: $search}}')
+
+	SEARCH_RES=""
+	for _anilist_attempt in 1 2; do
+		SEARCH_RES=$(curl -fsS \
+			--connect-timeout 10 \
+			--max-time 20 \
+			-H 'Content-Type: application/json' \
+			-H 'Accept: application/json' \
+			-H 'User-Agent: tosho-cli/3.8' \
+			--data "$ANILIST_PAYLOAD" \
+			"$ANILIST_API_URL" 2>/dev/null) && break
+		if [ "$_anilist_attempt" -eq 1 ]; then
+			echo "AniList request failed, retrying in 2s..." >&2
+			sleep 2
+		fi
+	done
+	[ -z "$SEARCH_RES" ] && error "AniList request failed after retry."
+
+	if echo "$SEARCH_RES" | jq -e '.errors? and (.errors | length > 0)' >/dev/null 2>&1; then
+		echo "$SEARCH_RES" | jq -r '.errors[]?.message // "AniList returned an unknown error."' >&2
+		exit 1
+	fi
+
+	# Search AniList (TV/MOVIE primary focus).
+	JQ_ANILIST_DEFS='
+      def title_blob:
+        ([.title.userPreferred, .title.english, .title.romaji, .title.native] + (.synonyms // []))
+        | map(select(. != null and . != ""))
+        | join(" | ");
+      def auxiliary_title:
+        title_blob | test("mini[ ._-]*anime|marumaru[ ._-]*no[ ._-]*mahou|●●[ ._-]*no[ ._-]*mahou|hensh[uū]|hench[uū]|recap|summary|compilation|picture[ ._-]*drama|chibi[ ._-]*shorts|special[ ._-]*episode"; "i");
+    '
+	JQ_ANILIST_FIELDS='
+      | [
+          .id,
+          (.title.userPreferred // .title.english // .title.romaji // "Unknown"),
+          (.title.romaji // ""),
+          (.title.english // ""),
+          (.format // "?"),
+          (.seasonYear // .startDate.year // "N/A"),
+          (.season // "?"),
+          (.episodes // "?"),
+          ([.externalLinks[]? | select((.site // "" | ascii_downcase) == "anidb") | .url][0] // "")
+        ] | @tsv
+    '
+
+	RESULT_LINES=$(echo "$SEARCH_RES" | jq -r "$JQ_ANILIST_DEFS"'
+      .data.Page.media[]?
+      | select((.format // "") as $f | ($f == "TV" or $f == "MOVIE"))
+      | select(auxiliary_title | not)
+      '"$JQ_ANILIST_FIELDS")
+
+	if [ -z "$RESULT_LINES" ]; then
+		RESULT_LINES=$(echo "$SEARCH_RES" | jq -r "$JQ_ANILIST_DEFS"'
+          .data.Page.media[]?
+          | select(auxiliary_title | not)
+          '"$JQ_ANILIST_FIELDS")
+	fi
+
+	[ -z "$RESULT_LINES" ] && error "No anime found on AniList for: $QUERY"
+
+	ANILIST_CHOICE=$(printf '%s\n' "$RESULT_LINES" |
+		awk -F '\t' 'BEGIN { OFS="\t" } {
+            id=$1; preferred=$2; romaji=$3; english=$4; format=$5; year=$6; season=$7; eps=$8; anidburl=$9;
+            label=preferred;
+            if (english != "" && english != preferred) label=preferred " / " english;
+            if (romaji != "" && romaji != preferred && romaji != english) label=label " [" romaji "]";
+            aid="?";
+            if (match(anidburl, /\/anime\/[0-9]+/)) {
+                aid=substr(anidburl, RSTART+7, RLENGTH-7);
+            } else if (match(anidburl, /\/a[0-9]+/)) {
+                aid=substr(anidburl, RSTART+2, RLENGTH-2);
+            }
+            print id, label " (" year ") [" format "] [" season "] [Episodes: " eps "] [AniDB: " aid "]";
+          }' |
+		fzf --layout=reverse --delimiter=$'\t' --with-nth=2.. --prompt='Select Anime: ')
+
+	[ -z "$ANILIST_CHOICE" ] && exit 0
+
+	ANILIST_ID=$(cut -f1 <<<"$ANILIST_CHOICE")
+	MEDIA_JSON=$(echo "$SEARCH_RES" | jq -c --arg id "$ANILIST_ID" '.data.Page.media[] | select(.id == ($id | tonumber))')
+	[ -z "$MEDIA_JSON" ] && error "Could not load the selected AniList entry."
+
+	PREFERRED_TITLE=$(jq -r '.title.userPreferred // .title.english // .title.romaji // "Unknown"' <<<"$MEDIA_JSON")
+	MAL_ID=$(jq -r '.idMal // empty' <<<"$MEDIA_JSON")
+	FORMAT=$(jq -r '.format // "TV"' <<<"$MEDIA_JSON")
+	MEDIA_SEASON=$(jq -r '.season // empty' <<<"$MEDIA_JSON")
+	MEDIA_SEASON_YEAR=$(jq -r '.seasonYear // .startDate.year // empty' <<<"$MEDIA_JSON")
+	TOTAL_EPS=$(jq -r '.episodes // empty' <<<"$MEDIA_JSON")
+	NEXT_AIRING_EPISODE=$(jq -r '.nextAiringEpisode.episode // empty' <<<"$MEDIA_JSON")
+
+	MAX_EPISODE="$TOTAL_EPS"
+	if [[ "$NEXT_AIRING_EPISODE" =~ ^[0-9]+$ ]] && [ "$NEXT_AIRING_EPISODE" -gt 0 ]; then
+		LATEST_EPISODE=$((NEXT_AIRING_EPISODE - 1))
+		# If the show is airing, cap the selectable episodes to the latest aired one.
+		if [ -z "$MAX_EPISODE" ] || [ "$LATEST_EPISODE" -lt "$MAX_EPISODE" ]; then
+			MAX_EPISODE="$LATEST_EPISODE"
+		fi
+	fi
+
+	MEDIA_START_DATE=$(jq -r 'if .startDate.year and .startDate.month and .startDate.day then ([.startDate.year,.startDate.month,.startDate.day] | @tsv) elif .startDate.year then ([.startDate.year,1,1] | @tsv) else empty end' <<<"$MEDIA_JSON" | awk -F '\t' '{printf "%04d-%02d-%02d", $1, $2, $3}')
+
+	ANIDB_URL=$(jq -r '[.externalLinks[]? | select((.site // "" | ascii_downcase) == "anidb") | .url][0] // empty' <<<"$MEDIA_JSON")
+	ANIDB_AID=""
+	ANIDB_AID=$(resolve_anidb_aid "$ANILIST_ID" "$MAL_ID" 2>/dev/null || true)
+	if [ -z "$ANIDB_AID" ] && [ -n "$ANIDB_URL" ]; then
+		ANIDB_AID=$(printf '%s\n' "$ANIDB_URL" | extract_anidb_aid)
+	fi
+
+	ABSOLUTE_OFFSET=$(calculate_absolute_offset "$ANILIST_ID")
+
+	printf 'AniList: %s (#%s)\n' "$PREFERRED_TITLE" "$ANILIST_ID"
+	if [[ "$ANIDB_AID" =~ ^[0-9]+$ ]]; then
+		printf 'AniDB:   AID %s\n' "$ANIDB_AID"
+	else
+		error "Could not resolve an AniDB AID for AniList #$ANILIST_ID ($PREFERRED_TITLE). Refusing a title-only AnimeTosho search because it can mix seasons."
+	fi
+	printf 'Season:  %s %s (%s)\n' "${MEDIA_SEASON:-?}" "${MEDIA_SEASON_YEAR:-?}" "${MEDIA_START_DATE:-?}"
+
+fi
+
+# === 3. SELECT EPISODE ======================================================
+if [ "$RESUME_MODE" = false ]; then
+	EP_CHOICE=""
+	case "$FORMAT" in
+	MOVIE) ;;
+	*)
+		if [[ "$MAX_EPISODE" =~ ^[0-9]+$ ]] && [ "$MAX_EPISODE" -gt 0 ]; then
+			EP_CHOICE=$(seq 1 "$MAX_EPISODE" | fzf --layout=reverse --prompt='Select Episode: ')
+		else
+			read -r -p "Enter Episode Number: " EP_CHOICE
+		fi
+		[ -z "$EP_CHOICE" ] && exit 0
+		;;
+	esac
+fi
+
+if [ "$FORMAT" = "MOVIE" ]; then
+	echo "Selected: $PREFERRED_TITLE"
+else
+	printf 'Selected: %s — Episode %s\n' "$PREFERRED_TITLE" "$EP_CHOICE"
+fi
+
+# === 4. SEARCH ANIMETOSHO ===================================================
+
+AT_RESULTS='[]'
+TARGET_EID=''
+
+if [ "$FORMAT" = "MOVIE" ]; then
+	AT_Q="$PREFERRED_TITLE"
+	AT_RESPONSE=$(anime_tosho_query "aids=$ANIDB_AID" "q=$AT_Q" "page=1" 2>/dev/null || true)
+else
+	EP_PADDED=$(printf '%02d' "$EP_CHOICE")
+	AT_RESPONSE=$(anime_tosho_query "aids=$ANIDB_AID" "q=$PREFERRED_TITLE $EP_PADDED" "page=1" 2>/dev/null || true)
+
+	if [ -z "$AT_RESPONSE" ]; then
+		AT_RESPONSE=$(anime_tosho_query "aids=$ANIDB_AID" "q=$PREFERRED_TITLE" "page=1" 2>/dev/null || true)
+	fi
+fi
+
+if [ -z "$AT_RESPONSE" ] || [ "$AT_RESPONSE" = "[]" ] || [ "$AT_RESPONSE" = "null" ]; then
+	error "AnimeTosho request failed."
+fi
+
+AT_RESULTS=$(printf '%s' "$AT_RESPONSE" | normalize_tosho_json 2>/dev/null || printf '[]')
+AT_RESULTS=$(jq -c --arg aid "$ANIDB_AID" '[ .[] | select((((.anidb_aid // .anidbAid // 0) | tostring) == $aid)) | select((.magnet_uri // .magnet // .magnetUri // "") != "") ]' <<<"$AT_RESULTS")
+
+if [ "$(jq 'length' <<<"$AT_RESULTS")" -lt 50 ]; then
+	AT_RESPONSE_FALLBACK=$(anime_tosho_query "aids=$ANIDB_AID" "page=1" 2>/dev/null || true)
+	AT_RESULTS_FALLBACK=$(printf '%s' "$AT_RESPONSE_FALLBACK" | normalize_tosho_json 2>/dev/null || printf '[]')
+	AT_RESULTS_FALLBACK=$(jq -c --arg aid "$ANIDB_AID" '[ .[] | select((((.anidb_aid // .anidbAid // 0) | tostring) == $aid)) | select((.magnet_uri // .magnet // .magnetUri // "") != "") ]' <<<"$AT_RESULTS_FALLBACK")
+	AT_RESULTS=$(jq -c '. + $fallback | unique_by(.magnet_uri // .magnet // .magnetUri // .title)' --argjson fallback "$AT_RESULTS_FALLBACK" <<<"$AT_RESULTS")
+fi
+
+if [ "$FORMAT" != "MOVIE" ]; then
+	TARGET_EID=$(discover_tosho_eid "$AT_RESULTS" "$EP_CHOICE" "$ABSOLUTE_OFFSET")
+
+	AT_RESULTS=$(filter_episode_releases "$AT_RESULTS" "$ANIDB_AID" "$TARGET_EID" "$EP_CHOICE" "$ABSOLUTE_OFFSET")
+fi
+
+AT_RESULTS=$(jq -c '
+  [ .[]
+    | (.title // .name // .release // "") as $t
+    | select(($t | test("mini[ ._-]*anime|marumaru[ ._-]*no[ ._-]*mahou|●●[ ._-]*no[ ._-]*mahou|\bHensh[uū]\b|\bHen[ch][sš]h[uū]\b|\brecap\b|\bsummary\b|\bcompilation\b|picture[ ._-]*drama"; "i")) | not)
+  ]
+' <<<"$AT_RESULTS")
+
+AT_RESULTS=$(jq -c '
+  unique_by(
+    (.info_hash // .infoHash // .magnet_uri // .magnet // .magnetUri //
+     ((.title // .name // "") + "|" + ((.total_size // .size // 0) | tostring)))
+  )
+' <<<"$AT_RESULTS")
+
+STREAM_COUNT=$(jq 'length' <<<"$AT_RESULTS")
+if [ "$STREAM_COUNT" -eq 0 ]; then
+	error "No AnimeTosho releases found for $PREFERRED_TITLE${EP_CHOICE:+ episode $EP_CHOICE}."
+fi
+
+AT_RESULTS=$(attach_torbox_cache_status "$AT_RESULTS")
+
+# === 5. SELECT RELEASE ======================================================
+SELECTED_RELEASE=$(build_release_lines "$AT_RESULTS" |
+	fzf --layout=reverse --no-sort --delimiter=$'\t' --with-nth=2.. --prompt='Select Release (* Cached > Quality > Seeds): ')
+
+[ -z "$SELECTED_RELEASE" ] && exit 0
+MAGNET=$(cut -f1 <<<"$SELECTED_RELEASE")
+[ -z "$MAGNET" ] && error "Selected AnimeTosho release has no magnet URI."
+
+SELECTED_RELEASE_JSON=$(jq -c --arg magnet "$MAGNET" '[ .[] | select((.magnet_uri // .magnet // .magnetUri // "") == $magnet) ] | .[0] // {}' <<<"$AT_RESULTS")
+RELEASE_TITLE=$(jq -r '.title // .name // .release // ""' <<<"$SELECTED_RELEASE_JSON")
+RELEASE_IS_BATCH=false
+if printf '%s' "$RELEASE_TITLE" | grep -Eiq '(\bbatch\b|\bcomplete\b|\bcollection\b|\bseason[ ._-]*[0-9]{1,2}\b|\bcour[ ._-]*[0-9]{1,2}\b|[0-9]{1,3}[[:space:]]*[-~][[:space:]]*[0-9]{1,3})'; then
+	RELEASE_IS_BATCH=true
+fi
+
+# === 6. ADD MAGNET TO TORBOX ================================================
+[[ "$MAGNET" == magnet:* ]] || error "Invalid magnet URI: $MAGNET"
+TORBOX_CREATE=$(curl -fsS \
+	--connect-timeout 10 \
+	--max-time 30 \
+	-X POST \
+	-H "Authorization: Bearer $TORBOX_KEY" \
+	-H 'Accept: application/json' \
+	--form-string "magnet=$MAGNET" \
+	--form-string 'seed=3' \
+	--form-string 'allow_zip=false' \
+	--form-string "name=$PREFERRED_TITLE${EP_CHOICE:+ - Episode $EP_CHOICE}" \
+	"$TORBOX_API_BASE/$TORBOX_API_VERSION/api/torrents/createtorrent") ||
+	error "TorBox could not add the selected release."
+
+if ! echo "$TORBOX_CREATE" | jq -e '.success == true' >/dev/null 2>&1; then
+	echo "$TORBOX_CREATE" | jq -r '.detail // .error // "Unknown TorBox error."' >&2
+	exit 1
+fi
+
+TORRENT_ID=$(echo "$TORBOX_CREATE" | jq -r '.data.torrent_id // .data.id // empty')
+[ -z "$TORRENT_ID" ] && error "TorBox did not return a torrent ID."
+
+# === 7. WAIT + FIND CORRECT VIDEO FILE =====================================
+# Wait for TorBox and select the correct video file.
+START_TIME=$(date +%s)
+VIDEO_FILE_ID=""
+
+if [ -z "$RELEASE_SEASON_NUMBER" ] && [ -n "$TARGET_EID" ]; then
+	RELEASE_SEASON_NUMBER=$(jq -r '
+      [ .[]
+        | (.title // .name // "") as $t
+        | select($t | test("\\bS[0-9]{1,2}[ ._-]*E[0-9]+\\b"; "i"))
+        | ($t | capture("\\bS(?<s>[0-9]{1,2})[ ._-]*E[0-9]+\\b"; "i").s)
+      ] | .[0] // empty
+    ' <<<"$AT_RESULTS")
+fi
+
+select_torbox_video_file() {
+	local torrent_info="$1"
+
+	jq -c \
+		--argjson ep "${EP_CHOICE:-0}" \
+		--arg expected_season "${RELEASE_SEASON_NUMBER:-}" \
+		--arg is_batch "${RELEASE_IS_BATCH:-false}" '
+      def files: (.data.files // (.data[0].files // []));
+      def raw_name: (.name // .path // .filename // .short_name // "");
+      def base_name: (raw_name | split("/") | .[-1]);
+      def is_video:
+        ((.mimetype // "") | startswith("video/")) or
+        ((base_name) | test("\\.(mkv|mp4|m4v|webm|avi|mov|ts|m2ts)$"; "i"));
+
+      def sxe_match:
+        if (base_name | test("\\bS[0-9]{1,2}[ ._-]*(?:E|EP|EPISODE)[ ._-]*0*[0-9]{1,4}\\b"; "i")) then
+          (base_name | capture("\\bS(?<s>[0-9]{1,2})[ ._-]*(?:E|EP|EPISODE)[ ._-]*0*(?<e>[0-9]{1,4})\\b"; "i")) as $m
+          | {
+              found: true,
+              season: ($m.s | tonumber),
+              episode: ($m.e | tonumber)
+            }
+        else
+          {found: false, season: null, episode: null}
+        end;
+
+      def named_episode_match:
+        if (base_name | test("\\b(?:EPISODE|EP|E)[ ._-]*0*[0-9]{1,4}(?:V[0-9]+)?\\b"; "i")) then
+          (base_name | capture("\\b(?:EPISODE|EP|E)[ ._-]*0*(?<e>[0-9]{1,4})(?:V[0-9]+)?\\b"; "i")) as $m
+          | ($m.e | tonumber)
+        else null end;
+
+      def bare_episode_match:
+        if (base_name | test("(?:^|[ ._-])0*" + ($ep|tostring) + "(?:[ ._-]|\\(|\\[|$)"; "i")) then true else false end;
+
+      def exact_episode_score:
+        (sxe_match) as $sxe |
+        if $ep == 0 then 0
+        elif $expected_season != "" and $sxe.found and
+             $sxe.episode == $ep and $sxe.season == ($expected_season | tonumber) then 400
+        elif $sxe.found and $sxe.episode == $ep and $expected_season == "" then 350
+        elif ($sxe.found and $sxe.episode == $ep and $sxe.season != ($expected_season | tonumber)) then -1000
+        elif ((named_episode_match // -1) == $ep) then 300
+        elif bare_episode_match then 200
+        else 0 end;
+
+      def resolution:
+        if (base_name | test("\\b(2160p|4k)\\b"; "i")) then 4
+        elif (base_name | test("\\b1080p\\b"; "i")) then 3
+        elif (base_name | test("\\b720p\\b"; "i")) then 2
+        elif (base_name | test("\\b(576p|480p|360p)\\b"; "i")) then 1
+        else 0 end;
+
+      (files
+       | map(select(is_video))
+       | map(. + { _name: raw_name, _base: base_name })
+       | map(. + { _score: exact_episode_score, _resolution: resolution, _size: ((.size // 0) | tonumber? // 0) })
+      ) as $all
+      |
+      if $ep != 0 then
+        ($all | map(select(._score >= 200)) | sort_by(._score, ._resolution, ._size, ._base) | reverse) as $matches
+        | if ($matches | length) > 0 then $matches[0]
+          elif $is_batch == "true" then empty
+          elif ($all | length) == 1 then $all[0]
+          else empty end
+      else
+        ($all | sort_by(._resolution, ._size, ._base) | reverse | .[0] // empty)
+      end
+    ' <<<"$torrent_info"
+}
+
+UNKNOWN_STATE_COUNT=0
+while true; do
+	NOW=$(date +%s)
+	ELAPSED=$((NOW - START_TIME))
+	if [ "$ELAPSED" -ge "$TORBOX_MAX_WAIT" ]; then
+		printf '\n'
+		error "Timed out waiting for TorBox. Check torrent $TORRENT_ID in your TorBox account."
+	fi
+
+	TORRENT_INFO=$(curl -fsS \
+		--connect-timeout 10 \
+		--max-time 20 \
+		-G \
+		-H "Authorization: Bearer $TORBOX_KEY" \
+		"$TORBOX_API_BASE/$TORBOX_API_VERSION/api/torrents/mylist" \
+		--data-urlencode "id=$TORRENT_ID" \
+		--data-urlencode 'bypass_cache=true' \
+		--data-urlencode 'limit=1' \
+		2>/dev/null || true)
+
+	if [ -n "$TORRENT_INFO" ] && echo "$TORRENT_INFO" | jq -e '.success == true' >/dev/null 2>&1; then
+		STATE=$(echo "$TORRENT_INFO" | jq -r '.data.download_state // .data[0].download_state // "unknown"')
+		PROGRESS=$(echo "$TORRENT_INFO" | jq -r '.data.progress // .data[0].progress // 0' | awk '{printf "%.1f", $1 * 100}')
+		DONE=$(echo "$TORRENT_INFO" | jq -r '(.data.download_finished // .data[0].download_finished // false)')
+		PRESENT=$(echo "$TORRENT_INFO" | jq -r '(.data.download_present // .data[0].download_present // false)')
+		CACHED=$(echo "$TORRENT_INFO" | jq -r '(.data.cached // .data[0].cached // false)')
+
+		if [ "$STATE" = "unknown" ]; then
+			UNKNOWN_STATE_COUNT=$((UNKNOWN_STATE_COUNT + 1))
+			if [ "$UNKNOWN_STATE_COUNT" -ge 10 ]; then
+				printf '\n'
+				error "TorBox returned 'unknown' state for $UNKNOWN_STATE_COUNT consecutive polls. Check torrent $TORRENT_ID in your TorBox account."
+			fi
+		else
+			UNKNOWN_STATE_COUNT=0
+		fi
+
+		VIDEO_FILE=$(select_torbox_video_file "$TORRENT_INFO")
+
+		if [ -n "$VIDEO_FILE" ] && [ "$VIDEO_FILE" != "null" ] && { [ "$DONE" = true ] || [ "$PRESENT" = true ] || [ "$CACHED" = true ]; }; then
+			VIDEO_FILE_ID=$(echo "$VIDEO_FILE" | jq -r '.id // empty')
+			[ -n "$VIDEO_FILE_ID" ] && break
+		fi
+
+		printf '\rTorBox: %-24s %6s%%  [%ss]' "$STATE" "$PROGRESS" "$ELAPSED"
+	fi
+
+	sleep "$TORBOX_POLL_INTERVAL"
+done
+printf '\n'
+
+if [ -n "$EP_CHOICE" ]; then
+	if [ -z "$VIDEO_FILE_ID" ]; then
+		error "TorBox has the torrent, but no file matching Episode $EP_CHOICE was found. Refusing to play a different episode from the batch."
+	fi
+fi
+
+# === 8. REQUEST TEMPORARY CDN URL ===========================================
+STREAM_URL=$(curl -fsS \
+	--connect-timeout 10 \
+	--max-time 20 \
+	-G \
+	-H "Authorization: Bearer $TORBOX_KEY" \
+	"$TORBOX_API_BASE/$TORBOX_API_VERSION/api/torrents/requestdl" \
+	--data-urlencode "token=$TORBOX_KEY" \
+	--data-urlencode "torrent_id=$TORRENT_ID" \
+	--data-urlencode "file_id=$VIDEO_FILE_ID" \
+	--data-urlencode 'redirect=false' \
+	--data-urlencode 'append_name=true' |
+	jq -r '.data // empty') ||
+	error "TorBox could not create a playback URL."
+
+[ -z "$STREAM_URL" ] && error "TorBox returned an empty playback URL."
+
+# === 9. PLAYBACK CONTROLLER =================================================
+# mpv IPC playback controller.
+
+CONTROLLER_IPC=""
+CONTROLLER_PID=""
+
+controller_cleanup() {
+	if [ -n "${CONTROLLER_IPC:-}" ]; then
+		rm -f "$CONTROLLER_IPC" 2>/dev/null || true
+		CONTROLLER_IPC=""
+	fi
+	tput cnorm 2>/dev/null || true
+}
+
+controller_send() {
+	local json="$1"
+	[ -S "$CONTROLLER_IPC" ] || return 1
+
+	if ! command -v socat >/dev/null 2>&1; then
+		error "socat is not installed but is required for mpv IPC communication."
+	fi
+
+	printf '%s\n' "$json" | socat - "UNIX-CONNECT:$CONTROLLER_IPC" >/dev/null 2>&1
+	return $?
+}
+
+# Shared fzf playback menu (returns 0=replay, 10=next, 11=prev, 12=select, 13=quit).
+show_playback_menu() {
+	local header_line="$1"
+	local menu_out="$2"
+	local menu_key="" menu_selection="" fzf_rc=0
+
+	: >"$menu_out"
+	{
+		printf '%s\n' "$header_line"
+		printf '\n'
+		printf 'Next\nReplay\nPrevious\nSelect Ep\nQuit\n'
+	} | fzf \
+		--layout=reverse \
+		--height=100% \
+		--no-input \
+		--no-info \
+		--no-multi \
+		--disabled \
+		--pointer='> ' \
+		--marker='  ' \
+		--header-lines=2 \
+		--expect='1,2,3,4,5' \
+		--bind='double-click:accept' \
+		>"$menu_out"
+	fzf_rc=$?
+
+	if [ -s "$menu_out" ]; then
+		menu_key="$(sed -n '1p' "$menu_out")"
+		menu_selection="$(sed -n '2p' "$menu_out")"
+	fi
+
+	if [ "$fzf_rc" -ne 0 ] && [ -z "$menu_key" ] && [ -z "$menu_selection" ]; then
+		echo 13
+	elif [ -n "$menu_key" ]; then
+		case "$menu_key" in
+		1) echo 10 ;;
+		2) echo 0 ;;
+		3) echo 11 ;;
+		4) echo 12 ;;
+		5) echo 13 ;;
+		*) echo 13 ;;
+		esac
+	else
+		case "$menu_selection" in
+		Next) echo 10 ;;
+		Replay) echo 0 ;;
+		Previous) echo 11 ;;
+		"Select Ep") echo 12 ;;
+		Quit) echo 13 ;;
+		*) echo 13 ;;
+		esac
+	fi
+}
+
+run_mpvshell_controller() {
+	local ep="$1"
+	local title="$2"
+	local url="$3"
+	local socket_dir socket action=0
+	local menu_out
+
+	# If the terminal isn't interactive, fall back to ordinary mpv playback.
+	if ! [ -t 0 ] || ! [ -t 1 ]; then
+		mpv --alang="$MPV_AUDIO_LANGS" --slang="$MPV_SUB_LANGS" \
+			--subs-fallback=no --subs-match-os-language=no \
+			"$url"
+		return 0
+	fi
+
+	socket_dir="$(mktemp -d "${TMPDIR:-/tmp}/tosho-cli.XXXXXX")" || return 1
+	socket="$socket_dir/mpv.sock"
+	CONTROLLER_IPC="$socket"
+	menu_out="$socket_dir/menu.out"
+
+	MPV_LOG="$socket_dir/mpv.log"
+	mpv \
+		--terminal=no \
+		--force-window=yes \
+		--input-ipc-server="$socket" \
+		--alang="$MPV_AUDIO_LANGS" \
+		--slang="$MPV_SUB_LANGS" \
+		--subs-fallback=no \
+		--subs-match-os-language=no \
+		"$url" >"$MPV_LOG" 2>&1 </dev/null &
+	CONTROLLER_PID=$!
+
+	# Wait for mpv to create its IPC socket.
+	for _ in {1..100}; do
+		[ -S "$socket" ] && break
+		if ! kill -0 "$CONTROLLER_PID" 2>/dev/null; then
+			wait "$CONTROLLER_PID" 2>/dev/null || true
+			if [ -s "$MPV_LOG" ]; then
+				tail -n 8 "$MPV_LOG" >&2 || true
+			fi
+			controller_cleanup
+			rm -rf "$socket_dir"
+			CONTROLLER_PID=""
+			return 0
+		fi
+		sleep 0.05
+	done
+
+	if ! [ -S "$socket" ]; then
+		if [ -s "$MPV_LOG" ]; then
+			printf 'Warning: mpv IPC socket was not created.\n' >&2
+			tail -n 8 "$MPV_LOG" >&2 || true
+		fi
+		kill "$CONTROLLER_PID" 2>/dev/null || true
+		wait "$CONTROLLER_PID" 2>/dev/null || true
+		controller_cleanup
+		rm -rf "$socket_dir"
+		CONTROLLER_PID=""
+		return 1
+	fi
+
+	if ! controller_send '{"command":["get_property","time-pos"]}'; then
+		printf 'Error: mpv IPC socket is present but cannot be contacted.\n' >&2
+		kill "$CONTROLLER_PID" 2>/dev/null || true
+		wait "$CONTROLLER_PID" 2>/dev/null || true
+		controller_cleanup
+		rm -rf "$socket_dir"
+		CONTROLLER_PID=""
+		return 1
+	fi
+
+	tput clear 2>/dev/null || printf '\033[2J\033[H'
+
+	while true; do
+		action=$(show_playback_menu "Playing episode $ep of $title..." "$menu_out")
+
+		case "$action" in
+		0)
+			# Replay in-place through mpv IPC; don't re-add/re-download.
+			if ! controller_send '{"command":["set_property","time-pos",0]}'; then
+				# If mpv is already dead/closed, break so we can re-exec the episode.
+				controller_send '{"command":["quit"]}' || true
+				break
+			fi
+			;;
+		10 | 11 | 12 | 13)
+			# mpv may already have ended naturally, so a failed quit is OK.
+			controller_send '{"command":["quit"]}' || true
+			break
+			;;
+		esac
+	done
+
+	wait "$CONTROLLER_PID" 2>/dev/null || true
+	CONTROLLER_PID=""
+	controller_cleanup
+	rm -rf "$socket_dir"
+
+	return "$action"
+}
+
+run_syncplay_controller() {
+	local ep="$1"
+	local title="$2"
+	local url="$3"
+	local action=0
+	local menu_out
+	local syncplay_pid tmp_dir
+
+	# If the terminal isn't interactive, just run Syncplay in the foreground.
+	if ! [ -t 0 ] || ! [ -t 1 ]; then
+		syncplay \
+			--no-gui \
+			--host "$SYNCPLAY_SERVER" \
+			--name "$SYNCPLAY_USER" \
+			--room "$SYNCPLAY_ROOM" \
+			--player-path "$(command -v mpv)" \
+			"$url" \
+			-- \
+			--alang="$MPV_AUDIO_LANGS" \
+			--slang="$MPV_SUB_LANGS" \
+			--subs-fallback=no \
+			--subs-match-os-language=no
+		return 0
+	fi
+
+	tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/tosho-cli.XXXXXX")" || return 1
+	menu_out="$tmp_dir/menu.out"
+
+	# Run Syncplay in the background so the terminal stays free for the menu.
+	syncplay \
+		--no-gui \
+		--host "$SYNCPLAY_SERVER" \
+		--name "$SYNCPLAY_USER" \
+		--room "$SYNCPLAY_ROOM" \
+		--player-path "$(command -v mpv)" \
+		"$url" \
+		-- \
+		--alang="$MPV_AUDIO_LANGS" \
+		--slang="$MPV_SUB_LANGS" \
+		--subs-fallback=no \
+		--subs-match-os-language=no >"$tmp_dir/syncplay.log" 2>&1 </dev/null &
+	syncplay_pid=$!
+
+	# Give Syncplay a moment to connect and start mpv.
+	sleep 2
+
+	if ! kill -0 "$syncplay_pid" 2>/dev/null; then
+		printf 'Warning: Syncplay exited immediately. Check the log:\n' >&2
+		tail -n 8 "$tmp_dir/syncplay.log" >&2 2>/dev/null || true
+		wait "$syncplay_pid" 2>/dev/null || true
+		rm -rf "$tmp_dir"
+		return 13
+	fi
+
+	tput clear 2>/dev/null || printf '\033[2J\033[H'
+
+	while true; do
+		# If Syncplay exited on its own (user closed mpv, etc.), show the
+		# menu one last time so the user can choose what to do next.
+		if ! kill -0 "$syncplay_pid" 2>/dev/null; then
+			wait "$syncplay_pid" 2>/dev/null || true
+			syncplay_pid=""
+		fi
+
+		local header
+		if [ -n "$syncplay_pid" ]; then
+			header="Syncplay: episode $ep of $title [room: $SYNCPLAY_ROOM]"
+		else
+			header="Playback ended: episode $ep of $title"
+		fi
+
+		action=$(show_playback_menu "$header" "$menu_out")
+
+		if [ -n "$syncplay_pid" ]; then
+			pkill -9 -P "$syncplay_pid" 2>/dev/null || true
+			kill -9 "$syncplay_pid" 2>/dev/null || true
+			wait "$syncplay_pid" 2>/dev/null || true
+		fi
+		break
+	done
+
+	rm -rf "$tmp_dir"
+	return "$action"
+}
+
+# Clean up terminal state even if the script is interrupted.
+trap controller_cleanup EXIT INT TERM
+
+if [ "$USE_SYNCPLAY" = true ]; then
+	if [ -z "$SYNCPLAY_ROOM" ]; then
+		error "Syncplay room is not configured. Please edit $CONFIG_FILE and set SYNCPLAY_ROOM."
+	fi
+	run_syncplay_controller "$EP_CHOICE" "$PREFERRED_TITLE" "$STREAM_URL"
+	PLAYBACK_ACTION=$?
+else
+	run_mpvshell_controller "$EP_CHOICE" "$PREFERRED_TITLE" "$STREAM_URL"
+	PLAYBACK_ACTION=$?
+fi
+
+controller_cleanup
+
+# === 10. PLAYBACK NAVIGATION ===============================================
+if [ "$FORMAT" != "MOVIE" ] && [[ "$EP_CHOICE" =~ ^[0-9]+$ ]]; then
+	case "$PLAYBACK_ACTION" in
+	0)
+		NAV_EP=$EP_CHOICE
+		;;
+	10)
+		NAV_EP=$((EP_CHOICE + 1))
+		if [[ "$TOTAL_EPS" =~ ^[0-9]+$ ]] && [ "$TOTAL_EPS" -gt 0 ] && [ "$NAV_EP" -gt "$TOTAL_EPS" ]; then
+			tput clear 2>/dev/null || true
+			printf 'Reached the last AniList-listed episode (%s).\n' "$TOTAL_EPS"
+			exit 0
+		fi
+		;;
+	11)
+		NAV_EP=$((EP_CHOICE - 1))
+		if [ "$NAV_EP" -lt 1 ]; then
+			NAV_EP=1
+		fi
+		;;
+	12)
+		# Select an episode after stopping the current mpv process.
+		tput clear 2>/dev/null || true
+		if [[ "$MAX_EPISODE" =~ ^[0-9]+$ ]] && [ "$MAX_EPISODE" -gt 0 ]; then
+			NAV_EP=$(seq 1 "$MAX_EPISODE" | fzf --layout=reverse --prompt='Select Episode: ')
+		else
+			read -r -p 'Enter Episode Number: ' NAV_EP
+		fi
+		[ -z "$NAV_EP" ] && exit 0
+		if ! [[ "$NAV_EP" =~ ^[0-9]+$ ]] || [ "$NAV_EP" -lt 1 ]; then
+			error "Invalid episode number: $NAV_EP"
+		fi
+		if [[ "$MAX_EPISODE" =~ ^[0-9]+$ ]] && [ "$MAX_EPISODE" -gt 0 ] && [ "$NAV_EP" -gt "$MAX_EPISODE" ]; then
+			error "Episode $NAV_EP is outside the AniList episode range (1-$MAX_EPISODE)."
+		fi
+		;;
+	13)
+		exit 0
+		;;
+	*)
+		NAV_EP=$((EP_CHOICE + 1))
+		if [[ "$TOTAL_EPS" =~ ^[0-9]+$ ]] && [ "$TOTAL_EPS" -gt 0 ] && [ "$NAV_EP" -gt "$TOTAL_EPS" ]; then
+			exit 0
+		fi
+		;;
+	esac
+
+	NEXT_ARGS=()
+	if [ "$USE_SYNCPLAY" = true ]; then
+		if [ -z "$SYNCPLAY_ROOM" ]; then
+			error "Syncplay room is not configured. Please edit $CONFIG_FILE and set SYNCPLAY_ROOM."
+		fi
+		NEXT_ARGS+=(--sync)
+	fi
+	exec "$SELF" "${NEXT_ARGS[@]}" \
+		--internal-resume \
+		"--internal-anilist-id=$ANILIST_ID" \
+		"--internal-anidb-aid=$ANIDB_AID" \
+		"--internal-mal-id=$MAL_ID" \
+		"--internal-title=$PREFERRED_TITLE" \
+		"--internal-episode=$NAV_EP" \
+		"--internal-format=$FORMAT" \
+		"--internal-total-eps=$TOTAL_EPS" \
+		"--internal-max-episode=$MAX_EPISODE" \
+		"--internal-absolute-offset=$ABSOLUTE_OFFSET"
+fi

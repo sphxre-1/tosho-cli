@@ -1,0 +1,26 @@
+name: Lint Shell Scripts
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install ShellCheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+
+      - name: Install shfmt
+        run: sudo snap install shfmt
+
+      - name: Run ShellCheck
+        run: shellcheck tosho-cli install.sh
+
+      - name: Run shfmt check
+        run: shfmt -d tosho-cli install.sh
