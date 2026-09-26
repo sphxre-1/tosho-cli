@@ -799,13 +799,13 @@ else
 	EP_PADDED=$(printf '%02d' "$EP_CHOICE")
 	AT_RESPONSE=$(anime_tosho_query "aids=$ANIDB_AID" "q=$PREFERRED_TITLE $EP_PADDED" "page=1" 2>/dev/null || true)
 
-	if [ -z "$AT_RESPONSE" ]; then
+	if [ -z "$AT_RESPONSE" ] || [ "$AT_RESPONSE" = "[]" ] || [ "$AT_RESPONSE" = "null" ]; then
 		AT_RESPONSE=$(anime_tosho_query "aids=$ANIDB_AID" "q=$PREFERRED_TITLE" "page=1" 2>/dev/null || true)
 	fi
 fi
 
-if [ -z "$AT_RESPONSE" ] || [ "$AT_RESPONSE" = "[]" ] || [ "$AT_RESPONSE" = "null" ]; then
-	error "AnimeTosho request failed."
+if [ -z "$AT_RESPONSE" ] || [ "$AT_RESPONSE" = "null" ]; then
+	AT_RESPONSE="[]"
 fi
 
 AT_RESULTS=$(printf '%s' "$AT_RESPONSE" | normalize_tosho_json 2>/dev/null || printf '[]')
@@ -816,6 +816,10 @@ if [ "$(jq 'length' <<<"$AT_RESULTS")" -lt 50 ]; then
 	AT_RESULTS_FALLBACK=$(printf '%s' "$AT_RESPONSE_FALLBACK" | normalize_tosho_json 2>/dev/null || printf '[]')
 	AT_RESULTS_FALLBACK=$(jq -c --arg aid "$ANIDB_AID" '[ .[] | select((((.anidb_aid // .anidbAid // 0) | tostring) == $aid)) | select((.magnet_uri // .magnet // .magnetUri // "") != "") ]' <<<"$AT_RESULTS_FALLBACK")
 	AT_RESULTS=$(jq -c '. + $fallback | unique_by(.magnet_uri // .magnet // .magnetUri // .title)' --argjson fallback "$AT_RESULTS_FALLBACK" <<<"$AT_RESULTS")
+fi
+
+if [ -z "$AT_RESULTS" ] || [ "$AT_RESULTS" = "[]" ]; then
+	error "No releases found on AnimeTosho for this anime."
 fi
 
 if [ "$FORMAT" != "MOVIE" ]; then
