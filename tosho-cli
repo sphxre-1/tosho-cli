@@ -315,7 +315,7 @@ filter_episode_releases() {
         | select(
             (((.anidb_eid // .anidbEid // 0) | tostring) as $teid | ($eid_array | length > 0 and ($eid_array | index($teid) != null)))
             or batch_range_contains_episode
-            or title_matches_episode
+            or (((.anidb_eid // .anidbEid // 0) == 0 or ($eid_array | length == 0)) and title_matches_episode)
           )
       ]
     ' <<<"$json"
