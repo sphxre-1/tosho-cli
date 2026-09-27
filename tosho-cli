@@ -480,12 +480,13 @@ extract_aid_from_legacy_mapping() {
 
 calculate_absolute_offset() {
 	local current_id="$1"
+	local target_anidb="$2"
 	local total_offset=0
 	local depth=0
 
 	while [ -n "$current_id" ] && [ "$depth" -lt 10 ]; do
 		local json body
-		body=$(jq -n --argjson id "$current_id" '{query: "query($id:Int){Media(id:$id, type:ANIME){relations{edges{relationType node{id episodes type}}}} }", variables: {id: $id}}')
+		body=$(jq -n --argjson id "$current_id" '{query: "query($id:Int){Media(id:$id, type:ANIME){relations{edges{relationType node{id idMal episodes type}}}} }", variables: {id: $id}}')
 
 		json=$(curl -fsS -X POST -H "Content-Type: application/json" -d "$body" "$ANILIST_API_URL" 2>/dev/null) || break
 
@@ -493,12 +494,19 @@ calculate_absolute_offset() {
 		prequel_json=$(jq -c '.data.Media.relations.edges[]? | select(.relationType == "PREQUEL" and .node.type == "ANIME") | .node' <<<"$json" | head -n 1)
 		[ -z "$prequel_json" ] && break
 
-		local p_id p_eps
+		local p_id p_mal p_eps p_anidb
 		p_id=$(jq -r '.id // empty' <<<"$prequel_json")
+		p_mal=$(jq -r '.idMal // empty' <<<"$prequel_json")
 		p_eps=$(jq -r '.episodes // empty' <<<"$prequel_json")
 		[ -z "$p_eps" ] && p_eps=0
 
 		if [ -n "$p_id" ]; then
+			if [ -n "$target_anidb" ]; then
+				p_anidb=$(resolve_anidb_aid "$p_id" "$p_mal")
+				if [ "$p_anidb" != "$target_anidb" ]; then
+					break
+				fi
+			fi
 			total_offset=$((total_offset + p_eps))
 			current_id="$p_id"
 		else
@@ -758,7 +766,7 @@ GRAPHQL
 		ANIDB_AID=$(printf '%s\n' "$ANIDB_URL" | extract_anidb_aid)
 	fi
 
-	ABSOLUTE_OFFSET=$(calculate_absolute_offset "$ANILIST_ID")
+	ABSOLUTE_OFFSET=$(calculate_absolute_offset "$ANILIST_ID" "$ANIDB_AID")
 
 	printf 'AniList: %s (#%s)\n' "$PREFERRED_TITLE" "$ANILIST_ID"
 	if [[ "$ANIDB_AID" =~ ^[0-9]+$ ]]; then
