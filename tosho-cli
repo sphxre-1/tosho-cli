@@ -293,6 +293,7 @@ filter_episode_releases() {
         title_of as $t |
         ($t | test(ep_re($ep); "i"))
         or ($abs_ep > 0 and $abs_ep != $ep and ($t | test(ep_re($abs_ep); "i")));
+      def batch_range_contains_episode:
         title_of as $t |
         # Explicit season+episode range, e.g. S01E01-S01E28.
         "\\bS(?<s1>[0-9]{1,2})[ ._-]*(?:E|EP|EPISODE)[ ._-]*(?<e1>[0-9]{1,4})[[:space:]]*[-~][[:space:]]*(?:S[0-9]{1,2}[ ._-]*)?(?:E|EP|EPISODE)[ ._-]*(?<e2>[0-9]{1,4})\\b" as $sre |
@@ -359,6 +360,7 @@ build_release_lines() {
       def peer_of: ((.leechers // .peers // 0) | tonumber? // 0);
       def cache_rank: (if ._torbox_cached == true then 1 else 0 end);
       def resolution_rank:
+      def batch_range_contains_episode:
         title_of as $t |
         if ($t | test("\\b(2160p|4k)\\b"; "i")) then 4
         elif ($t | test("\\b1080p\\b"; "i")) then 3
