@@ -360,7 +360,6 @@ build_release_lines() {
       def peer_of: ((.leechers // .peers // 0) | tonumber? // 0);
       def cache_rank: (if ._torbox_cached == true then 1 else 0 end);
       def resolution_rank:
-      def batch_range_contains_episode:
         title_of as $t |
         if ($t | test("\\b(2160p|4k)\\b"; "i")) then 4
         elif ($t | test("\\b1080p\\b"; "i")) then 3
@@ -940,8 +939,10 @@ select_torbox_video_file() {
           | ($m.e | tonumber)
         else null end;
 
+      def no_s: "(?<!\\bpart[ ._-])(?<!\\bpart)(?<!\\bseason[ ._-])(?<!\\bseason)(?<!\\bcour[ ._-])(?<!\\bcour)(?<!\\bstage[ ._-])(?<!\\bstage)(?<!\\bs[ ._-])(?<!\\bs)";
+      def ep_re(num): "(^|[^a-zA-Z0-9])((S[0-9]{1,2}[ ._-]*)?(E|EP(ISODE)?)[ ._-]*0*" + (num|tostring) + "(V[0-9]+)?([^a-zA-Z0-9.]|\\.(?![0-9])|$)(?![ \\-]*bit)|" + no_s + "0*" + (num|tostring) + "(V[0-9]+)?([^a-zA-Z0-9.]|\\.(?![0-9])|$)(?![ \\-]*bit))";
       def bare_episode_match:
-        if (base_name | test("(^|[^a-zA-Z0-9])((S[0-9]{1,2}[ ._-]*)?(E|EP(ISODE)?)[ ._-]*0*" + ($ep|tostring) + "(V[0-9]+)?([^a-zA-Z0-9.]|\\.(?![0-9])|$)(?![ \\-]*bit)|" + "(?<!\\bpart[ ._-])(?<!\\bpart)(?<!\\bseason[ ._-])(?<!\\bseason)(?<!\\bcour[ ._-])(?<!\\bcour)(?<!\\bstage[ ._-])(?<!\\bstage)(?<!\\bs[ ._-])(?<!\\bs)" + "0*" + ($ep|tostring) + "(V[0-9]+)?([^a-zA-Z0-9.]|\\.(?![0-9])|$)(?![ \\-]*bit))"; "i")) then true else false end;
+        if (base_name | test(ep_re($ep); "i")) then true else false end;
 
       def exact_episode_score:
         (sxe_match) as $sxe |
