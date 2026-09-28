@@ -13,7 +13,7 @@
 #
 # Optional config overrides:
 #   ANILIST_API_URL="https://graphql.anilist.co"
-#   ANIMETOSHO_URL="https://feed.animetosho.xyz"
+#   ANIMETOSHO_URL="https://feed.animetosho.net"
 #   ANIMETOSHO_JSON_PATH="/json"
 #   TORBOX_API_BASE="https://api.torbox.app"
 #   TORBOX_API_VERSION="v1"
@@ -57,7 +57,7 @@ fi
 
 TORBOX_KEY="${TORBOX_KEY:-}"
 ANILIST_API_URL="${ANILIST_API_URL:-https://graphql.anilist.co}"
-ANIMETOSHO_URL="${ANIMETOSHO_URL:-https://feed.animetosho.xyz}"
+ANIMETOSHO_URL="${ANIMETOSHO_URL:-https://feed.animetosho.net}"
 ANIMETOSHO_JSON_PATH="${ANIMETOSHO_JSON_PATH:-/json}"
 ANIMAP_API_BASE="${ANIMAP_API_BASE:-https://animap.id}"
 TORBOX_API_BASE="${TORBOX_API_BASE:-https://api.torbox.app}"

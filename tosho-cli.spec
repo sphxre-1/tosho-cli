@@ -1,6 +1,6 @@
 Name:           tosho-cli
 Version:        3.8.0
-Release:        8%{?dist}
+Release:        9%{?dist}
 Summary:        A Linux CLI anime streaming tool using AnimeTosho and TorBox
 
 License:        GPLv3
